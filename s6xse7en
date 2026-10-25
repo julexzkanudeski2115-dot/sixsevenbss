@@ -1,59 +1,39 @@
---[[
-    S6x Se7en c o d e i — BSS macro
-    Bracket V2 UI
-    auto farm selectable fields / auto convert / patterns / anti-afk
-]]
+--[[ S6x Se7en c o d e i — BSS macro Bracket V2 UI
+     v12: pad lock — cancel MoveTo + re-pin during convert ]]
 
-local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/WetCheezit/Bracket-V2/main/src.lua"))()
-
+local Library     = loadstring(game:HttpGet("https://raw.githubusercontent.com/WetCheezit/Bracket-V2/main/src.lua"))()
 local Players     = game:GetService("Players")
 local Workspace   = game:GetService("Workspace")
 local VirtualUser = game:GetService("VirtualUser")
+local VIM         = game:GetService("VirtualInputManager")
 local player      = Players.LocalPlayer
-
 local TAG = "[S6x Se7en c o d e i]"
 
--- ─────────────────────────────────────────────────────────────
--- state
--- ─────────────────────────────────────────────────────────────
+local RESUME_CONFIRM_TICKS = 4
+local RETRY_CONFIRM_TICKS  = 10
+local CONVERT_COOLDOWN     = 3
 
 local state = {
-    autoFarm        = false,
-    autoConvert     = false,
-    antiAfk         = true,
-    autoEquip       = true,
-
-    field           = nil,
-    pattern         = "Square",
-    radius          = 30,
-    walkSpeed       = 32,
-
-    convertInterval = 90,
-    hiveWait        = 4,
-
-    converting      = false,
-    convertStart    = 0,
-    lastConvert     = os.clock(),
+    autoFarm = false, autoConvert = false, antiAfk = true, autoEquip = true,
+    field = nil, pattern = "Square", radius = 30, walkSpeed = 32,
+    hiveWait = 4, bagThreshold = 100, resumeBelow = 5,
+    converting = false, lastConvert = 0,
+    lmbHeld = false,
+    bagSource = nil, bagWarned = false,
+    hiveSource = "none",
+    gateState = "farming",
+    emptyStreak = 0,
+    fullStreak = 0,
 }
 
--- ─────────────────────────────────────────────────────────────
--- character helpers
--- ─────────────────────────────────────────────────────────────
-
-local function getChar()
-    return player.Character
-end
-
+-- ═══ character ═══════════════════════════════════════════════
+local function getChar() return player.Character end
 local function getRoot()
-    local char = getChar()
-    return char and char:FindFirstChild("HumanoidRootPart")
+    local c = getChar(); return c and c:FindFirstChild("HumanoidRootPart")
 end
-
 local function getHum()
-    local char = getChar()
-    return char and char:FindFirstChildOfClass("Humanoid")
+    local c = getChar(); return c and c:FindFirstChildOfClass("Humanoid")
 end
-
 local function waitForChar()
     if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
         player.CharacterAdded:Wait()
@@ -61,11 +41,446 @@ local function waitForChar()
     end
 end
 
--- ─────────────────────────────────────────────────────────────
--- tool equip
--- ─────────────────────────────────────────────────────────────
+-- cancels any pending MoveTo target, so the humanoid stops walking
+local function cancelMove()
+    local hum, root = getHum(), getRoot()
+    if not hum or not root then return end
+    pcall(function() hum:Move(Vector3.zero) end)
+    pcall(function() hum:MoveTo(root.Position) end)
+end
 
-local COLLECTOR_PATTERNS = { "scooper", "vacuum", "canister" }
+local function tp(cf)
+    local root = getRoot()
+    if not root or not cf then return end
+    cancelMove()
+    root.CFrame = cf
+    pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+    pcall(function() root.AssemblyAngularVelocity = Vector3.zero end)
+    cancelMove()
+end
+
+-- keeps the character pinned to cf for `seconds`; re-pins if it drifts
+local function lockToPad(cf, seconds, label)
+    local stop = false
+    local thread = task.spawn(function()
+        local t0 = os.clock()
+        while not stop do
+            if os.clock() - t0 >= seconds then break end
+            local root = getRoot()
+            if root then
+                local drift = (root.Position - cf.Position).Magnitude
+                if drift > 3 then
+                    cancelMove()
+                    root.CFrame = cf
+                    pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+                    pcall(function() root.AssemblyAngularVelocity = Vector3.zero end)
+                    if label then
+                        print(string.format("%s %s re-pin (drift %.1f)", TAG, label, drift))
+                    end
+                else
+                    cancelMove()
+                end
+            end
+            task.wait(0.08)
+        end
+    end)
+    return function() stop = true end, thread
+end
+
+-- ═══ mouse hold ══════════════════════════════════════════════
+local function mouseDown()
+    if state.lmbHeld then return end
+    state.lmbHeld = true
+    if mouse1press then
+        if pcall(mouse1press) then return end
+    end
+    if mouse1down then
+        if pcall(mouse1down) then return end
+    end
+    local cam = Workspace.CurrentCamera
+    local s = (cam and cam.ViewportSize) or Vector2.new(800, 600)
+    pcall(function()
+        VIM:SendMouseButtonEvent(s.X/2, s.Y/2, 0, true, game, 1)
+    end)
+end
+
+local function mouseUp()
+    if not state.lmbHeld then return end
+    state.lmbHeld = false
+    if mouse1release then
+        if pcall(mouse1release) then return end
+    end
+    if mouse1up then
+        if pcall(mouse1up) then return end
+    end
+    local cam = Workspace.CurrentCamera
+    local s = (cam and cam.ViewportSize) or Vector2.new(800, 600)
+    pcall(function()
+        VIM:SendMouseButtonEvent(s.X/2, s.Y/2, 0, false, game, 1)
+    end)
+end
+
+local function refreshHold()
+    if not state.lmbHeld then return end
+    state.lmbHeld = false
+    mouseUp()
+    task.wait(0.08)
+    mouseDown()
+end
+
+local function pressE()
+    if keypress and keyrelease then
+        local ok = pcall(function()
+            keypress(0x45)
+            task.wait(0.1)
+            keyrelease(0x45)
+        end)
+        if ok then return true end
+    end
+    return (pcall(function()
+        VIM:SendKeyEvent(true,  Enum.KeyCode.E, false, game)
+        task.wait(0.1)
+        VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end))
+end
+
+-- ═══ hive instance ═══════════════════════════════════════════
+local function getHiveInstance()
+    local folder = Workspace:FindFirstChild("Honeycombs")
+    if not folder then return nil end
+    for _, slot in ipairs(folder:GetChildren()) do
+        for _, field in ipairs({ "Owner", "Player", "User", "Username" }) do
+            local o = slot:FindFirstChild(field)
+            if o then
+                if o:IsA("ObjectValue") and o.Value == player then return slot end
+                if o:IsA("StringValue") and o.Value == player.Name then return slot end
+            end
+        end
+    end
+    return nil
+end
+
+local function findHivePrompt()
+    local hive = getHiveInstance()
+    if not hive then return nil end
+    for _, d in ipairs(hive:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then return d end
+    end
+    return nil
+end
+
+local function padAbove(part, extra)
+    extra = extra or 3
+    return CFrame.new(part.Position + Vector3.new(0, part.Size.Y/2 + extra, 0))
+end
+
+local function getHiveCFrame()
+    local prompt = findHivePrompt()
+    if prompt and prompt.Parent and prompt.Parent:IsA("BasePart") then
+        state.hiveSource = "hive prompt: " .. prompt.Parent:GetFullName()
+        return padAbove(prompt.Parent)
+    end
+
+    local sp = player:FindFirstChild("SpawnPos")
+    if sp then
+        if sp:IsA("CFrameValue") and sp.Value then
+            state.hiveSource = "player.SpawnPos (CFrameValue)"
+            return sp.Value
+        end
+        if sp:IsA("Vector3Value") and sp.Value then
+            state.hiveSource = "player.SpawnPos (Vector3Value)"
+            return CFrame.new(sp.Value)
+        end
+        if sp:IsA("ObjectValue") and sp.Value then
+            local v = sp.Value
+            if v:IsA("BasePart") then
+                state.hiveSource = "player.SpawnPos -> " .. v:GetFullName()
+                return padAbove(v)
+            end
+        end
+    end
+
+    local rl = player.RespawnLocation
+    if rl and rl:IsA("SpawnLocation") then
+        state.hiveSource = "Player.RespawnLocation: " .. rl:GetFullName()
+        return padAbove(rl, 4)
+    end
+
+    local hive = getHiveInstance()
+    if hive then
+        for _, name in ipairs({
+            "ConvertPad","SpawnPad","SpawnLocation","SpawnPos",
+            "Pad","Spawn","Convert","Stand","Floor","Ground",
+        }) do
+            local p = hive:FindFirstChild(name, true)
+            if p and p:IsA("BasePart") then
+                state.hiveSource = "hive." .. name .. ": " .. p:GetFullName()
+                return padAbove(p)
+            end
+        end
+        if hive:IsA("Model") then
+            local ok, cf, size = pcall(function()
+                local c, s = hive:GetBoundingBox()
+                return c, s
+            end)
+            if ok and cf and size then
+                state.hiveSource = "hive bounding box: " .. hive:GetFullName()
+                return cf * CFrame.new(0, size.Y/2 + 4, 0)
+            end
+            local pok, pivot = pcall(function() return hive:GetPivot() end)
+            if pok then
+                state.hiveSource = "hive pivot (fallback): " .. hive:GetFullName()
+                return pivot + Vector3.new(0, 6, 0)
+            end
+        elseif hive:IsA("BasePart") then
+            state.hiveSource = "hive part: " .. hive:GetFullName()
+            return padAbove(hive)
+        end
+    end
+
+    state.hiveSource = "none"
+    return nil
+end
+
+-- ═══ convert triggers ════════════════════════════════════════
+local function firePrompt()
+    local hive = getHiveInstance()
+    if not hive then return false end
+
+    local prompts = {}
+    pcall(function()
+        for _, d in ipairs(hive:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then prompts[#prompts+1] = d end
+        end
+    end)
+
+    if #prompts == 0 then
+        local hcf = getHiveCFrame()
+        if hcf then
+            pcall(function()
+                for _, d in ipairs(Workspace:GetDescendants()) do
+                    if d:IsA("ProximityPrompt") and d.Parent then
+                        local pok, pos = pcall(function() return d.Parent.Position end)
+                        if pok and pos and (pos - hcf.Position).Magnitude < 25 then
+                            prompts[#prompts+1] = d
+                        end
+                    end
+                end
+            end)
+        end
+    end
+
+    if #prompts == 0 or not fireproximityprompt then return false end
+
+    local fired = false
+    for _, prompt in ipairs(prompts) do
+        pcall(function() prompt.HoldDuration = 0 end)
+        pcall(function() prompt.MaxActivationDistance = 99999 end)
+        pcall(function() prompt.RequiresLineOfSight = false end)
+        if pcall(function() fireproximityprompt(prompt) end) then fired = true end
+    end
+    return fired
+end
+
+local function fireButtonOverlay()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg or not firesignal then return false end
+
+    local targets = {}
+    local screen = pg:FindFirstChild("ScreenGui")
+    if screen then
+        local npc = screen:FindFirstChild("NPC")
+        if npc then
+            local overlay = npc:FindFirstChild("ButtonOverlay")
+            if overlay then targets[#targets+1] = overlay end
+        end
+    end
+    pcall(function()
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d:IsA("TextButton") or d:IsA("ImageButton") then
+                local label = d.Name
+                if d:IsA("TextButton") and type(d.Text) == "string" then
+                    label = label .. " " .. d.Text
+                end
+                if label:lower():find("convert", 1, true) then
+                    targets[#targets+1] = d
+                end
+            end
+        end
+    end)
+
+    local fired = false
+    for _, btn in ipairs(targets) do
+        if pcall(function() firesignal(btn.MouseButton1Click) end) then fired = true end
+        pcall(function() firesignal(btn.Activated) end)
+    end
+    return fired
+end
+
+-- ═══ doConvert ═══════════════════════════════════════════════
+local function doConvert()
+    if state.converting then return end
+    state.converting = true
+
+    local ok, err = pcall(function()
+        local hiveCF = getHiveCFrame()
+        if not hiveCF then
+            warn(TAG .. " convert: no hive CFrame found")
+            return
+        end
+        print(TAG .. " convert → hive pad via " .. state.hiveSource)
+
+        local root = getRoot()
+        local returnCF = root and root.CFrame or nil
+
+        -- release LMB so the collector tool doesn't swallow the prompt
+        mouseUp()
+
+        -- teleport then keep pinned while we wait for the prompt to settle
+        tp(hiveCF)
+        local unlock = lockToPad(hiveCF, 1.2, "landing")
+
+        -- confirm we're on the pad
+        root = getRoot()
+        if not root or (root.Position - hiveCF.Position).Magnitude > 20 then
+            warn(TAG .. " convert: still off pad after landing — aborting")
+            unlock()
+            task.wait(0.1)
+            if returnCF then tp(returnCF) end
+            return
+        end
+
+        -- fire while pinned
+        local method
+        if firePrompt() then
+            method = "proximityprompt"
+        elseif fireButtonOverlay() then
+            method = "ButtonOverlay"
+        elseif pressE() then
+            task.wait(0.25)
+            if fireButtonOverlay() then method = "E+ButtonOverlay" else method = "E" end
+        end
+
+        if method then
+            print(TAG .. " convert fired via " .. method .. " — holding pad for " .. state.hiveWait .. "s")
+        else
+            warn(TAG .. " convert: no prompt / no overlay / E unregistered")
+        end
+
+        -- keep pinned through the whole convert animation
+        unlock()
+        unlock = lockToPad(hiveCF, state.hiveWait + 0.5, "convert")
+        task.wait(state.hiveWait)
+        unlock()
+
+        -- return to farm spot with move state cleared
+        if returnCF then
+            cancelMove()
+            tp(returnCF)
+            task.wait(0.4)
+            if state.autoEquip then equipCollector() end
+        end
+    end)
+
+    state.converting = false
+    state.lastConvert = os.clock()
+    if not ok then warn(TAG .. " convert error: " .. tostring(err)) end
+end
+
+-- ═══ bag fullness from pollen bar ════════════════════════════
+local function parseNum(t)
+    if type(t) ~= "string" then return nil end
+    t = t:gsub(",", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local n = tonumber(t); if n then return n end
+    local k = t:match("([%d%.]+)%s*[kK]"); if k then return tonumber(k) * 1e3 end
+    local m = t:match("([%d%.]+)%s*[mM]"); if m then return tonumber(m) * 1e6 end
+    local b = t:match("([%d%.]+)%s*[bB]"); if b then return tonumber(b) * 1e9 end
+    return nil
+end
+
+local function parsePollenText(s)
+    if type(s) ~= "string" or s == "" then return nil end
+    local a, b = s:match("([%d,%.kKmMbB]+)%s*/%s*([%d,%.kKmMbB]+)")
+    if not a then a, b = s:match("([%d,%.kKmMbB]+)%s+of%s+([%d,%.kKmMbB]+)") end
+    if not a then a = s:match("([%d,%.kKmMbB]+)") end
+    local p, c = parseNum(a), parseNum(b)
+    if p then return p, c end
+    return nil
+end
+
+local function scanTopBar()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local roots = {}
+    local screen = pg:FindFirstChild("ScreenGui")
+    if screen then
+        local counters = screen:FindFirstChild("Counters")
+        if counters then roots[#roots+1] = counters end
+        roots[#roots+1] = screen
+    end
+    roots[#roots+1] = pg
+
+    for _, root in ipairs(roots) do
+        local bestP, bestC, bestLabel
+        pcall(function()
+            for _, d in ipairs(root:GetDescendants()) do
+                if (d:IsA("TextLabel") or d:IsA("TextButton"))
+                    and d.Visible ~= false and type(d.Text) == "string" then
+                    local p, c = parsePollenText(d.Text)
+                    if p and c and c > 0 and (not bestC or c > bestC) then
+                        bestP, bestC, bestLabel = p, c, d
+                    end
+                end
+            end
+        end)
+        if bestP and bestC then
+            state.bagSource = bestLabel
+            return bestP / bestC, bestP, bestC
+        end
+    end
+    return nil
+end
+
+local function scanGuiFill()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local best
+    pcall(function()
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d:IsA("Frame") or d:IsA("ImageLabel") then
+                local n = d.Name:lower()
+                local pn = d.Parent and d.Parent.Name:lower() or ""
+                if n:find("pollen", 1, true) and (n:find("fill", 1, true) or n:find("bar", 1, true)) then
+                    best = d
+                elseif not best and n:find("fill", 1, true) and pn:find("pollen", 1, true) then
+                    best = d
+                end
+            end
+        end
+    end)
+    if best then
+        state.bagSource = best
+        local sz = best.Size
+        local y = sz and sz.Y.Scale or 0
+        if y > 0 and y <= 1 then return y end
+        local x = sz and sz.X.Scale or 0
+        if x > 0 and x <= 1 then return x end
+    end
+    return nil
+end
+
+local function getBagFill()
+    local frac, p, c = scanTopBar()
+    if frac then return frac, p, c end
+    frac = scanGuiFill()
+    if frac then return frac end
+    return nil
+end
+
+-- ═══ tool equip ══════════════════════════════════════════════
+local COLLECTOR_PATTERNS = {
+    "scooper","scoop","vacuum","canister","rake","clipper","scythe","magnet",
+}
 
 local function isCollector(tool)
     local n = tool.Name:lower()
@@ -75,33 +490,29 @@ local function isCollector(tool)
     return false
 end
 
-local function equipCollector()
-    local char = getChar()
-    local hum  = getHum()
+function equipCollector()
+    local char, hum = getChar(), getHum()
     if not char or not hum or hum.Health <= 0 then return end
-
     for _, tool in ipairs(char:GetChildren()) do
         if tool:IsA("Tool") and isCollector(tool) then return end
     end
-
     local backpack = player:FindFirstChild("Backpack")
-    if backpack then
-        for _, tool in ipairs(backpack:GetChildren()) do
-            if tool:IsA("Tool") and isCollector(tool) then
+    if not backpack then return end
+    local fallback
+    for _, tool in ipairs(backpack:GetChildren()) do
+        if tool:IsA("Tool") then
+            if isCollector(tool) then
                 pcall(function() hum:EquipTool(tool) end)
                 return
             end
+            fallback = fallback or tool
         end
     end
+    if fallback then pcall(function() hum:EquipTool(fallback) end) end
 end
 
--- ─────────────────────────────────────────────────────────────
--- field / hive lookup
--- ─────────────────────────────────────────────────────────────
-
-local function getFlowerZones()
-    return Workspace:FindFirstChild("FlowerZones")
-end
+-- ═══ field ═══════════════════════════════════════════════════
+local function getFlowerZones() return Workspace:FindFirstChild("FlowerZones") end
 
 local function getFieldPart(name)
     local zones = getFlowerZones()
@@ -112,10 +523,8 @@ end
 local function getFieldCFrame(name)
     local part = getFieldPart(name)
     if not part then return nil end
-
-    if part:IsA("BasePart") then
-        return part.CFrame
-    elseif part:IsA("Model") then
+    if part:IsA("BasePart") then return part.CFrame end
+    if part:IsA("Model") then
         local ok, pivot = pcall(function() return part:GetPivot() end)
         if ok then return pivot end
     end
@@ -125,66 +534,38 @@ end
 local function getFieldRadiusCap(name)
     local part = getFieldPart(name)
     if part and part:IsA("BasePart") then
-        -- keep waypoints inside the field footprint
         return math.min(part.Size.X, part.Size.Z) * 0.45
     end
     return 100
 end
 
-local function getHiveCFrame()
-    local slots = Workspace:FindFirstChild("HiveSlots")
-    if not slots then return nil end
-
-    for _, slot in ipairs(slots:GetChildren()) do
-        local owner = slot:FindFirstChild("Owner")
-        if owner and owner:IsA("ObjectValue") and owner.Value == player then
-            if slot:IsA("Model") then
-                local ok, pivot = pcall(function() return slot:GetPivot() end)
-                if ok then return pivot + Vector3.new(0, 3, 0) end
-            elseif slot:IsA("BasePart") then
-                return slot.CFrame + Vector3.new(0, 3, 0)
-            end
-        end
-    end
-    return nil
-end
-
-local function tp(cf)
-    local root = getRoot()
-    if root and cf then
-        root.CFrame = cf
-    end
-end
-
--- ─────────────────────────────────────────────────────────────
--- movement
--- ─────────────────────────────────────────────────────────────
-
+-- ═══ movement ════════════════════════════════════════════════
 local function moveTo(pos, timeout)
-    local hum = getHum()
-    local root = getRoot()
+    local hum, root = getHum(), getRoot()
     if not hum or not root or hum.Health <= 0 then return false end
 
-    -- flatten destination to current ground height — humanoid walks on floor
     local target = Vector3.new(pos.X, root.Position.Y, pos.Z)
-
     local dist = (root.Position - target).Magnitude
     timeout = timeout or math.clamp(dist / math.max(state.walkSpeed, 10) * 2.5 + 3, 5, 30)
 
     hum.WalkSpeed = state.walkSpeed
-    hum:MoveTo(target)
-
     local t0 = os.clock()
+
     while os.clock() - t0 < timeout do
-        if not state.autoFarm then return false end
+        if not state.autoFarm then
+            cancelMove()
+            return false
+        end
         while state.converting do task.wait(0.1) end
 
         root = getRoot()
         if not root then return false end
+        hum = getHum() or hum
+        hum.WalkSpeed = state.walkSpeed
+        hum:MoveTo(target)
 
         local flat = Vector3.new(target.X, root.Position.Y, target.Z)
         if (root.Position - flat).Magnitude < 5 then return true end
-
         task.wait(0.1)
     end
     return false
@@ -192,148 +573,175 @@ end
 
 local function buildWaypoints(origin, pattern, radius)
     local pts = {}
-
     if pattern == "Square" then
         for _, r in ipairs({ radius, radius * 0.5 }) do
-            pts[#pts + 1] = origin + Vector3.new( r, 0,  r)
-            pts[#pts + 1] = origin + Vector3.new( r, 0, -r)
-            pts[#pts + 1] = origin + Vector3.new(-r, 0, -r)
-            pts[#pts + 1] = origin + Vector3.new(-r, 0,  r)
+            pts[#pts+1] = origin + Vector3.new( r, 0,  r)
+            pts[#pts+1] = origin + Vector3.new( r, 0, -r)
+            pts[#pts+1] = origin + Vector3.new(-r, 0, -r)
+            pts[#pts+1] = origin + Vector3.new(-r, 0,  r)
         end
     elseif pattern == "Circle" then
         for _, r in ipairs({ radius, radius * 0.5 }) do
             for i = 0, 7 do
                 local a = (i / 8) * math.pi * 2
-                pts[#pts + 1] = origin + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+                pts[#pts+1] = origin + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
             end
         end
     elseif pattern == "Line" then
-        local steps = 4
-        for i = 0, steps - 1 do
-            local z = -radius + (2 * radius) * (i / (steps - 1))
-            pts[#pts + 1] = origin + Vector3.new(-radius, 0, z)
-            pts[#pts + 1] = origin + Vector3.new( radius, 0, z)
+        for i = 0, 3 do
+            local z = -radius + (2 * radius) * (i / 3)
+            pts[#pts+1] = origin + Vector3.new(-radius, 0, z)
+            pts[#pts+1] = origin + Vector3.new( radius, 0, z)
         end
     elseif pattern == "Random" then
         for _ = 1, 10 do
             local a = math.random() * math.pi * 2
             local r = radius * (0.3 + math.random() * 0.7)
-            pts[#pts + 1] = origin + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+            pts[#pts+1] = origin + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
         end
     end
-
     return pts
 end
 
--- ─────────────────────────────────────────────────────────────
--- actions
--- ─────────────────────────────────────────────────────────────
-
-local function doConvert()
-    if state.converting then return end
-    state.converting   = true
-    state.convertStart = os.clock()
-
-    local ok, err = pcall(function()
-        local hive = getHiveCFrame()
-        if not hive then
-            warn(TAG .. " could not find your hive slot")
-            return
-        end
-        tp(hive)
-        task.wait(state.hiveWait)
-    end)
-
-    state.converting = false
-    if not ok then
-        warn(TAG .. " convert error: " .. tostring(err))
-    end
-end
-
-local function maybeConvertInLap(cf)
-    if not state.autoConvert then return end
-    if (os.clock() - state.lastConvert) < state.convertInterval then return end
-
-    doConvert()
-    state.lastConvert = os.clock()
-
-    -- re-center on field after conversion
-    tp(CFrame.new(cf.Position + Vector3.new(0, 4, 0)))
-    task.wait(0.4)
-    if state.autoEquip then equipCollector() end
-end
-
+-- ═══ farm lap ════════════════════════════════════════════════
 local function farmLap()
     if not state.field then return end
-
     waitForChar()
-    local cf = getFieldCFrame(state.field)
-    local root = getRoot()
-    if not cf or not root then return end
 
-    -- start at field center
+    local cf = getFieldCFrame(state.field)
+    if not cf then return end
+
     tp(CFrame.new(cf.Position + Vector3.new(0, 4, 0)))
     task.wait(0.4)
-
-    root = getRoot()
-    if not root then return end
-
     if state.autoEquip then equipCollector() end
+    task.wait(0.25)
+
+    mouseDown()
 
     local radius = math.min(state.radius, getFieldRadiusCap(state.field))
     local points = buildWaypoints(cf.Position, state.pattern, radius)
 
     for _, p in ipairs(points) do
-        if not state.autoFarm then return end
+        if not state.autoFarm then break end
         while state.converting do task.wait(0.1) end
-
-        maybeConvertInLap(cf)
 
         local reached = moveTo(p)
         if not reached and state.autoFarm then
-            -- stuck: re-center and continue to next waypoint
             tp(CFrame.new(cf.Position + Vector3.new(0, 4, 0)))
             task.wait(0.3)
+            refreshHold()
         end
     end
+
+    if not state.autoFarm then mouseUp() end
 end
 
--- ─────────────────────────────────────────────────────────────
--- controller loop
--- ─────────────────────────────────────────────────────────────
+-- ═══ farm thread ═════════════════════════════════════════════
+task.spawn(function()
+    while true do
+        if state.autoFarm then
+            local ok, err = pcall(farmLap)
+            if not ok then warn(TAG .. " farm error: " .. tostring(err)) end
+        elseif state.lmbHeld then
+            mouseUp()
+        end
+        task.wait(0.2)
+    end
+end)
 
 task.spawn(function()
     while true do
-        -- unstick a wedged conversion lock
-        if state.converting and (os.clock() - state.convertStart) > (state.hiveWait + 6) then
-            state.converting = false
+        if state.autoFarm and state.lmbHeld and not state.converting and mouse1press then
+            pcall(mouse1press)
         end
+        task.wait(1.5)
+    end
+end)
 
-        if state.autoFarm or state.autoConvert then
-            local ok, err = pcall(function()
-                if state.autoFarm then
-                    farmLap()
-                elseif state.autoConvert then
-                    if (os.clock() - state.lastConvert) >= state.convertInterval then
+-- ═══ pollen gate ═════════════════════════════════════════════
+task.spawn(function()
+    while true do
+        if state.autoConvert then
+            local frac = getBagFill()
+            if frac then
+                state.bagWarned = false
+                local pct = frac * 100
+                local sinceConvert = os.clock() - state.lastConvert
+
+                if state.gateState == "farming" then
+                    state.emptyStreak = 0
+                    state.fullStreak = 0
+
+                    if pct >= state.bagThreshold
+                        and sinceConvert > CONVERT_COOLDOWN
+                        and not state.converting then
+
+                        if state.autoFarm then
+                            state.autoFarm = false
+                            mouseUp()
+                            print(string.format("%s pollen FULL (%d%%) — auto farm OFF",
+                                TAG, math.floor(pct)))
+                        end
+
                         doConvert()
-                        state.lastConvert = os.clock()
+
+                        state.gateState = "waiting_empty"
+                        state.emptyStreak = 0
+                        state.fullStreak = 0
+                    end
+
+                elseif state.gateState == "waiting_empty" then
+                    if not state.converting then
+                        if pct <= state.resumeBelow then
+                            state.emptyStreak = state.emptyStreak + 1
+                            state.fullStreak = 0
+                            if state.emptyStreak >= RESUME_CONFIRM_TICKS then
+                                state.gateState = "farming"
+                                state.emptyStreak = 0
+                                state.autoFarm = true
+                                waitForChar()
+                                task.wait(0.2)
+                                mouseDown()
+                                print(string.format("%s pollen empty (%d%%) — auto farm ON",
+                                    TAG, math.floor(pct)))
+                            end
+                        elseif pct >= state.bagThreshold then
+                            state.emptyStreak = 0
+                            state.fullStreak = state.fullStreak + 1
+                            if state.fullStreak >= RETRY_CONFIRM_TICKS then
+                                state.fullStreak = 0
+                                state.gateState = "farming"
+                                print(TAG .. " convert failed to empty bag — retrying")
+                            end
+                        else
+                            state.emptyStreak = 0
+                            state.fullStreak = 0
+                        end
                     end
                 end
-            end)
-            if not ok then
-                warn(TAG .. " loop error: " .. tostring(err))
-                state.converting = false
+            elseif not state.bagWarned then
+                state.bagWarned = true
+                warn(TAG .. " could not read pollen bar — use Print Bag Status")
             end
+        else
+            state.gateState = "farming"
+            state.emptyStreak = 0
+            state.fullStreak = 0
         end
-
-        task.wait(0.15)
+        task.wait(0.4)
     end
 end)
 
 player.CharacterAdded:Connect(function()
     task.wait(1.5)
     state.converting = false
+    state.lmbHeld = false
+    state.bagSource = nil
+    state.gateState = "farming"
+    state.emptyStreak = 0
+    state.fullStreak = 0
     if state.autoEquip then equipCollector() end
+    if state.autoFarm then task.wait(0.5); mouseDown() end
 end)
 
 player.Idled:Connect(function()
@@ -342,12 +750,47 @@ player.Idled:Connect(function()
     VirtualUser:ClickButton2(Vector2.new())
 end)
 
--- ─────────────────────────────────────────────────────────────
--- UI
--- ─────────────────────────────────────────────────────────────
+-- ═══ HUD ═════════════════════════════════════════════════════
+local hud = Instance.new("ScreenGui")
+hud.Name = "S6xSe7enHUD"
+hud.ResetOnSpawn = false
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0, 440, 0, 26)
+label.Position = UDim2.new(0, 12, 1, -40)
+label.BackgroundTransparency = 0.4
+label.BackgroundColor3 = Color3.new(0, 0, 0)
+label.TextColor3 = Color3.new(1, 1, 1)
+label.Font = Enum.Font.Code
+label.TextSize = 13
+label.TextXAlignment = Enum.TextXAlignment.Left
+label.Text = "pollen: ?"
+label.Parent = hud
+local okHud = pcall(function() hud.Parent = player:WaitForChild("PlayerGui") end)
 
-local Window = Library:CreateWindow("S6x Se7en c o d e i")
+task.spawn(function()
+    while true do
+        if okHud then
+            local frac, p, c = getBagFill()
+            local farmTxt = state.autoFarm and "FARM" or "off"
+            local gateTxt = state.gateState
+            if state.emptyStreak > 0 then
+                gateTxt = gateTxt .. " " .. state.emptyStreak .. "/" .. RESUME_CONFIRM_TICKS
+            end
+            if state.converting then gateTxt = "converting" end
+            if frac then
+                label.Text = string.format("[%s | %s] pollen %d%%  (%s / %s)",
+                    farmTxt, gateTxt, math.floor(frac * 100),
+                    p and math.floor(p) or "?", c and math.floor(c) or "?")
+            else
+                label.Text = string.format("[%s | %s] pollen: not read", farmTxt, gateTxt)
+            end
+        end
+        task.wait(0.5)
+    end
+end)
 
+-- ═══ UI ══════════════════════════════════════════════════════
+local Window     = Library:CreateWindow("S6x Se7en c o d e i")
 local FarmTab    = Window:CreateTab("Farm")
 local ConvertTab = Window:CreateTab("Convert")
 local MiscTab    = Window:CreateTab("Misc")
@@ -355,28 +798,21 @@ local MiscTab    = Window:CreateTab("Misc")
 local function getFieldNames()
     local names = {}
     local zones = getFlowerZones()
-
     if zones then
         for _, v in ipairs(zones:GetChildren()) do
-            if v:IsA("BasePart") or v:IsA("Model") then
-                names[#names + 1] = v.Name
-            end
+            if v:IsA("BasePart") or v:IsA("Model") then names[#names+1] = v.Name end
         end
     end
-
     table.sort(names)
-
     if #names == 0 then
         names = {
-            "Mushroom Field", "Strawberry Field", "Blue Flower Field",
-            "Sunflower Field", "Pineapple Patch", "Pumpkin Patch",
-            "Cactus Field", "Bamboo Field", "Spider Field",
-            "Rose Field", "Pine Tree Forest", "Stump Field",
-            "Clover Field", "Mountain Top Field", "Coconut Field",
-            "Pepper Patch", "Dandelion Field",
+            "Mushroom Field","Strawberry Field","Blue Flower Field","Sunflower Field",
+            "Pineapple Patch","Pumpkin Patch","Cactus Field","Bamboo Field",
+            "Spider Field","Rose Field","Pine Tree Forest","Stump Field",
+            "Clover Field","Mountain Top Field","Coconut Field","Pepper Patch",
+            "Dandelion Field",
         }
     end
-
     return names
 end
 
@@ -390,38 +826,99 @@ local ConvertGroup = ConvertTab:CreateGroupbox("Convert", "Left")
 local ActionGroup  = ConvertTab:CreateGroupbox("Actions", "Right")
 local MiscGroup    = MiscTab:CreateGroupbox("Utility", "Left")
 
--- farm tab
 FieldGroup:CreateDropdown("Field", fieldNames, function(v) state.field = v end)
-FieldGroup:CreateDropdown("Pattern", {"Square", "Circle", "Line", "Random"}, function(v) state.pattern = v end)
+FieldGroup:CreateDropdown("Pattern", {"Square","Circle","Line","Random"}, function(v)
+    state.pattern = v
+end)
 FieldGroup:CreateSlider("Radius", 10, 100, 30, function(v) state.radius = v end)
 
 MoveGroup:CreateToggle("Auto Farm", function(v)
     state.autoFarm = v
-    if v then waitForChar() end
+    if v then
+        waitForChar()
+        task.spawn(function() task.wait(1); if state.autoFarm then mouseDown() end end)
+    else
+        mouseUp()
+    end
 end)
 MoveGroup:CreateSlider("Walk Speed", 16, 120, 32, function(v) state.walkSpeed = v end)
 MoveGroup:CreateButton("Teleport to Field", function()
     local cf = getFieldCFrame(state.field)
     if cf then tp(CFrame.new(cf.Position + Vector3.new(0, 4, 0))) end
 end)
-MoveGroup:CreateButton("Stop Farming", function() state.autoFarm = false end)
-
--- convert tab
-ConvertGroup:CreateToggle("Auto Convert", function(v)
-    state.autoConvert = v
-    if v then state.lastConvert = os.clock() end
+MoveGroup:CreateButton("Stop Farming", function()
+    state.autoFarm = false
+    mouseUp()
 end)
-ConvertGroup:CreateSlider("Convert Every (s)", 30, 300, 90, function(v) state.convertInterval = v end)
+
+ConvertGroup:CreateToggle("Auto Convert (pollen gate)", function(v)
+    state.autoConvert = v
+    state.bagWarned = false
+    state.bagSource = nil
+    state.gateState = "farming"
+    state.emptyStreak = 0
+    state.fullStreak = 0
+    if v then
+        print(TAG .. " pollen gate ON — stop at " .. state.bagThreshold ..
+              "%, resume below " .. state.resumeBelow .. "%")
+    end
+end)
+ConvertGroup:CreateSlider("Stop Farm at % Full", 50, 100, 100, function(v)
+    state.bagThreshold = v
+end)
+ConvertGroup:CreateSlider("Resume Farm below %", 1, 30, 5, function(v)
+    state.resumeBelow = v
+end)
 ConvertGroup:CreateSlider("Hive Wait (s)", 2, 10, 4, function(v) state.hiveWait = v end)
 
 ActionGroup:CreateButton("Convert Now", function()
     task.spawn(function()
+        local wasFarm = state.autoFarm
+        if wasFarm then
+            state.autoFarm = false
+            mouseUp()
+        end
         doConvert()
-        state.lastConvert = os.clock()
+        if wasFarm and not state.autoConvert then
+            state.autoFarm = true
+            waitForChar()
+            task.wait(0.3)
+            mouseDown()
+        end
     end)
 end)
+ActionGroup:CreateButton("Teleport to Hive Pad", function()
+    local cf = getHiveCFrame()
+    if cf then
+        tp(cf)
+        print(TAG .. " teleported via " .. state.hiveSource)
+    else
+        warn(TAG .. " no hive pad found")
+    end
+end)
+ActionGroup:CreateButton("Print Hive Info", function()
+    print(TAG .. " ── hive info ──")
+    local hive = getHiveInstance()
+    print("  hive instance:", hive and hive:GetFullName() or "nil")
+    print("  resolved pad source:", state.hiveSource)
+    print("  pad CFrame:", getHiveCFrame())
+    print("  player.SpawnPos:", player:FindFirstChild("SpawnPos"))
+    print("  player.RespawnLocation:", player.RespawnLocation)
+end)
+ActionGroup:CreateButton("Print Bag Status", function()
+    local frac, p, c = getBagFill()
+    print(TAG .. " ── pollen status ──")
+    print("  fraction:", frac, "current:", p, "capacity:", c)
+    print("  source:", state.bagSource and state.bagSource:GetFullName() or "none")
+    print("  gateState:", state.gateState,
+          " emptyStreak:", state.emptyStreak,
+          " fullStreak:", state.fullStreak,
+          " autoFarm:", state.autoFarm,
+          " converting:", state.converting,
+          " sinceConvert:", os.clock() - state.lastConvert)
+end)
+ActionGroup:CreateButton("Release Mouse", mouseUp)
 
--- misc tab
 MiscGroup:CreateToggle("Anti AFK", function(v) state.antiAfk = v end, true)
 MiscGroup:CreateToggle("Auto Equip Collector", function(v)
     state.autoEquip = v
