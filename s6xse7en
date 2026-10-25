@@ -7,7 +7,7 @@ local Workspace   = game:GetService("Workspace")
 local VirtualUser = game:GetService("VirtualUser")
 local VIM         = game:GetService("VirtualInputManager")
 local player      = Players.LocalPlayer
-local TAG = "[S6x Se7en c o d e i]"
+local TAG = "[No Bees Matter k o d z i a k]"
 
 local RESUME_CONFIRM_TICKS = 4
 local RETRY_CONFIRM_TICKS  = 10
