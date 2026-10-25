@@ -1,0 +1,430 @@
+--[[
+    S6x Se7en c o d e i — BSS macro
+    Bracket V2 UI
+    auto farm selectable fields / auto convert / patterns / anti-afk
+]]
+
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/WetCheezit/Bracket-V2/main/src.lua"))()
+
+local Players     = game:GetService("Players")
+local Workspace   = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+local player      = Players.LocalPlayer
+
+local TAG = "[S6x Se7en c o d e i]"
+
+-- ─────────────────────────────────────────────────────────────
+-- state
+-- ─────────────────────────────────────────────────────────────
+
+local state = {
+    autoFarm        = false,
+    autoConvert     = false,
+    antiAfk         = true,
+    autoEquip       = true,
+
+    field           = nil,
+    pattern         = "Square",
+    radius          = 30,
+    walkSpeed       = 32,
+
+    convertInterval = 90,
+    hiveWait        = 4,
+
+    converting      = false,
+    convertStart    = 0,
+    lastConvert     = os.clock(),
+}
+
+-- ─────────────────────────────────────────────────────────────
+-- character helpers
+-- ─────────────────────────────────────────────────────────────
+
+local function getChar()
+    return player.Character
+end
+
+local function getRoot()
+    local char = getChar()
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+    local char = getChar()
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function waitForChar()
+    if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
+        player.CharacterAdded:Wait()
+        player.Character:WaitForChild("HumanoidRootPart", 10)
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- tool equip
+-- ─────────────────────────────────────────────────────────────
+
+local COLLECTOR_PATTERNS = { "scooper", "vacuum", "canister" }
+
+local function isCollector(tool)
+    local n = tool.Name:lower()
+    for _, p in ipairs(COLLECTOR_PATTERNS) do
+        if n:find(p, 1, true) then return true end
+    end
+    return false
+end
+
+local function equipCollector()
+    local char = getChar()
+    local hum  = getHum()
+    if not char or not hum or hum.Health <= 0 then return end
+
+    for _, tool in ipairs(char:GetChildren()) do
+        if tool:IsA("Tool") and isCollector(tool) then return end
+    end
+
+    local backpack = player:FindFirstChild("Backpack")
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") and isCollector(tool) then
+                pcall(function() hum:EquipTool(tool) end)
+                return
+            end
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- field / hive lookup
+-- ─────────────────────────────────────────────────────────────
+
+local function getFlowerZones()
+    return Workspace:FindFirstChild("FlowerZones")
+end
+
+local function getFieldPart(name)
+    local zones = getFlowerZones()
+    if not zones or not name then return nil end
+    return zones:FindFirstChild(name)
+end
+
+local function getFieldCFrame(name)
+    local part = getFieldPart(name)
+    if not part then return nil end
+
+    if part:IsA("BasePart") then
+        return part.CFrame
+    elseif part:IsA("Model") then
+        local ok, pivot = pcall(function() return part:GetPivot() end)
+        if ok then return pivot end
+    end
+    return nil
+end
+
+local function getFieldRadiusCap(name)
+    local part = getFieldPart(name)
+    if part and part:IsA("BasePart") then
+        -- keep waypoints inside the field footprint
+        return math.min(part.Size.X, part.Size.Z) * 0.45
+    end
+    return 100
+end
+
+local function getHiveCFrame()
+    local slots = Workspace:FindFirstChild("HiveSlots")
+    if not slots then return nil end
+
+    for _, slot in ipairs(slots:GetChildren()) do
+        local owner = slot:FindFirstChild("Owner")
+        if owner and owner:IsA("ObjectValue") and owner.Value == player then
+            if slot:IsA("Model") then
+                local ok, pivot = pcall(function() return slot:GetPivot() end)
+                if ok then return pivot + Vector3.new(0, 3, 0) end
+            elseif slot:IsA("BasePart") then
+                return slot.CFrame + Vector3.new(0, 3, 0)
+            end
+        end
+    end
+    return nil
+end
+
+local function tp(cf)
+    local root = getRoot()
+    if root and cf then
+        root.CFrame = cf
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- movement
+-- ─────────────────────────────────────────────────────────────
+
+local function moveTo(pos, timeout)
+    local hum = getHum()
+    local root = getRoot()
+    if not hum or not root or hum.Health <= 0 then return false end
+
+    -- flatten destination to current ground height — humanoid walks on floor
+    local target = Vector3.new(pos.X, root.Position.Y, pos.Z)
+
+    local dist = (root.Position - target).Magnitude
+    timeout = timeout or math.clamp(dist / math.max(state.walkSpeed, 10) * 2.5 + 3, 5, 30)
+
+    hum.WalkSpeed = state.walkSpeed
+    hum:MoveTo(target)
+
+    local t0 = os.clock()
+    while os.clock() - t0 < timeout do
+        if not state.autoFarm then return false end
+        while state.converting do task.wait(0.1) end
+
+        root = getRoot()
+        if not root then return false end
+
+        local flat = Vector3.new(target.X, root.Position.Y, target.Z)
+        if (root.Position - flat).Magnitude < 5 then return true end
+
+        task.wait(0.1)
+    end
+    return false
+end
+
+local function buildWaypoints(origin, pattern, radius)
+    local pts = {}
+
+    if pattern == "Square" then
+        for _, r in ipairs({ radius, radius * 0.5 }) do
+            pts[#pts + 1] = origin + Vector3.new( r, 0,  r)
+            pts[#pts + 1] = origin + Vector3.new( r, 0, -r)
+            pts[#pts + 1] = origin + Vector3.new(-r, 0, -r)
+            pts[#pts + 1] = origin + Vector3.new(-r, 0,  r)
+        end
+    elseif pattern == "Circle" then
+        for _, r in ipairs({ radius, radius * 0.5 }) do
+            for i = 0, 7 do
+                local a = (i / 8) * math.pi * 2
+                pts[#pts + 1] = origin + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+            end
+        end
+    elseif pattern == "Line" then
+        local steps = 4
+        for i = 0, steps - 1 do
+            local z = -radius + (2 * radius) * (i / (steps - 1))
+            pts[#pts + 1] = origin + Vector3.new(-radius, 0, z)
+            pts[#pts + 1] = origin + Vector3.new( radius, 0, z)
+        end
+    elseif pattern == "Random" then
+        for _ = 1, 10 do
+            local a = math.random() * math.pi * 2
+            local r = radius * (0.3 + math.random() * 0.7)
+            pts[#pts + 1] = origin + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+        end
+    end
+
+    return pts
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- actions
+-- ─────────────────────────────────────────────────────────────
+
+local function doConvert()
+    if state.converting then return end
+    state.converting   = true
+    state.convertStart = os.clock()
+
+    local ok, err = pcall(function()
+        local hive = getHiveCFrame()
+        if not hive then
+            warn(TAG .. " could not find your hive slot")
+            return
+        end
+        tp(hive)
+        task.wait(state.hiveWait)
+    end)
+
+    state.converting = false
+    if not ok then
+        warn(TAG .. " convert error: " .. tostring(err))
+    end
+end
+
+local function maybeConvertInLap(cf)
+    if not state.autoConvert then return end
+    if (os.clock() - state.lastConvert) < state.convertInterval then return end
+
+    doConvert()
+    state.lastConvert = os.clock()
+
+    -- re-center on field after conversion
+    tp(CFrame.new(cf.Position + Vector3.new(0, 4, 0)))
+    task.wait(0.4)
+    if state.autoEquip then equipCollector() end
+end
+
+local function farmLap()
+    if not state.field then return end
+
+    waitForChar()
+    local cf = getFieldCFrame(state.field)
+    local root = getRoot()
+    if not cf or not root then return end
+
+    -- start at field center
+    tp(CFrame.new(cf.Position + Vector3.new(0, 4, 0)))
+    task.wait(0.4)
+
+    root = getRoot()
+    if not root then return end
+
+    if state.autoEquip then equipCollector() end
+
+    local radius = math.min(state.radius, getFieldRadiusCap(state.field))
+    local points = buildWaypoints(cf.Position, state.pattern, radius)
+
+    for _, p in ipairs(points) do
+        if not state.autoFarm then return end
+        while state.converting do task.wait(0.1) end
+
+        maybeConvertInLap(cf)
+
+        local reached = moveTo(p)
+        if not reached and state.autoFarm then
+            -- stuck: re-center and continue to next waypoint
+            tp(CFrame.new(cf.Position + Vector3.new(0, 4, 0)))
+            task.wait(0.3)
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- controller loop
+-- ─────────────────────────────────────────────────────────────
+
+task.spawn(function()
+    while true do
+        -- unstick a wedged conversion lock
+        if state.converting and (os.clock() - state.convertStart) > (state.hiveWait + 6) then
+            state.converting = false
+        end
+
+        if state.autoFarm or state.autoConvert then
+            local ok, err = pcall(function()
+                if state.autoFarm then
+                    farmLap()
+                elseif state.autoConvert then
+                    if (os.clock() - state.lastConvert) >= state.convertInterval then
+                        doConvert()
+                        state.lastConvert = os.clock()
+                    end
+                end
+            end)
+            if not ok then
+                warn(TAG .. " loop error: " .. tostring(err))
+                state.converting = false
+            end
+        end
+
+        task.wait(0.15)
+    end
+end)
+
+player.CharacterAdded:Connect(function()
+    task.wait(1.5)
+    state.converting = false
+    if state.autoEquip then equipCollector() end
+end)
+
+player.Idled:Connect(function()
+    if not state.antiAfk then return end
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
+
+-- ─────────────────────────────────────────────────────────────
+-- UI
+-- ─────────────────────────────────────────────────────────────
+
+local Window = Library:CreateWindow("S6x Se7en c o d e i")
+
+local FarmTab    = Window:CreateTab("Farm")
+local ConvertTab = Window:CreateTab("Convert")
+local MiscTab    = Window:CreateTab("Misc")
+
+local function getFieldNames()
+    local names = {}
+    local zones = getFlowerZones()
+
+    if zones then
+        for _, v in ipairs(zones:GetChildren()) do
+            if v:IsA("BasePart") or v:IsA("Model") then
+                names[#names + 1] = v.Name
+            end
+        end
+    end
+
+    table.sort(names)
+
+    if #names == 0 then
+        names = {
+            "Mushroom Field", "Strawberry Field", "Blue Flower Field",
+            "Sunflower Field", "Pineapple Patch", "Pumpkin Patch",
+            "Cactus Field", "Bamboo Field", "Spider Field",
+            "Rose Field", "Pine Tree Forest", "Stump Field",
+            "Clover Field", "Mountain Top Field", "Coconut Field",
+            "Pepper Patch", "Dandelion Field",
+        }
+    end
+
+    return names
+end
+
+Workspace:WaitForChild("FlowerZones", 20)
+local fieldNames = getFieldNames()
+state.field = fieldNames[1]
+
+local FieldGroup   = FarmTab:CreateGroupbox("Field", "Left")
+local MoveGroup    = FarmTab:CreateGroupbox("Movement", "Right")
+local ConvertGroup = ConvertTab:CreateGroupbox("Convert", "Left")
+local ActionGroup  = ConvertTab:CreateGroupbox("Actions", "Right")
+local MiscGroup    = MiscTab:CreateGroupbox("Utility", "Left")
+
+-- farm tab
+FieldGroup:CreateDropdown("Field", fieldNames, function(v) state.field = v end)
+FieldGroup:CreateDropdown("Pattern", {"Square", "Circle", "Line", "Random"}, function(v) state.pattern = v end)
+FieldGroup:CreateSlider("Radius", 10, 100, 30, function(v) state.radius = v end)
+
+MoveGroup:CreateToggle("Auto Farm", function(v)
+    state.autoFarm = v
+    if v then waitForChar() end
+end)
+MoveGroup:CreateSlider("Walk Speed", 16, 120, 32, function(v) state.walkSpeed = v end)
+MoveGroup:CreateButton("Teleport to Field", function()
+    local cf = getFieldCFrame(state.field)
+    if cf then tp(CFrame.new(cf.Position + Vector3.new(0, 4, 0))) end
+end)
+MoveGroup:CreateButton("Stop Farming", function() state.autoFarm = false end)
+
+-- convert tab
+ConvertGroup:CreateToggle("Auto Convert", function(v)
+    state.autoConvert = v
+    if v then state.lastConvert = os.clock() end
+end)
+ConvertGroup:CreateSlider("Convert Every (s)", 30, 300, 90, function(v) state.convertInterval = v end)
+ConvertGroup:CreateSlider("Hive Wait (s)", 2, 10, 4, function(v) state.hiveWait = v end)
+
+ActionGroup:CreateButton("Convert Now", function()
+    task.spawn(function()
+        doConvert()
+        state.lastConvert = os.clock()
+    end)
+end)
+
+-- misc tab
+MiscGroup:CreateToggle("Anti AFK", function(v) state.antiAfk = v end, true)
+MiscGroup:CreateToggle("Auto Equip Collector", function(v)
+    state.autoEquip = v
+    if v then equipCollector() end
+end, true)
+MiscGroup:CreateButton("Equip Collector Now", equipCollector)
